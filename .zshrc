@@ -71,7 +71,7 @@ ZSH_THEME="agnoster"
 # Add wisely, as too many plugins slow down shell startup.
 plugins=(git)
 
-# export SOLARIZED_THEME=light
+export SOLARIZED_THEME=light
 
 source $ZSH/oh-my-zsh.sh
 
