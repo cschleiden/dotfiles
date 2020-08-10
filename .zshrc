@@ -104,6 +104,10 @@ prompt_context () { }
 # alias ohmyzsh="mate ~/.oh-my-zsh"
 
 export GOPATH=~/go
+export GOROOT=/usr/local/opt/go/libexec
 export PATH="/usr/local/opt/node@12/bin:$GOPATH/bin:$PATH"
+export PATH=$PATH:$GOROOT/bin
 
 export PATH="$HOME/.yarn/bin:$HOME/.config/yarn/global/node_modules/.bin:$PATH"
+
+eval "$(rbenv init -)"
