@@ -110,4 +110,4 @@ export PATH=$PATH:$GOROOT/bin
 
 export PATH="$HOME/.yarn/bin:$HOME/.config/yarn/global/node_modules/.bin:$PATH"
 
-eval "$(rbenv init -)"
+# eval "$(rbenv init -)"
