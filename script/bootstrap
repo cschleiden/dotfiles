@@ -1,9 +1,0 @@
-if [ "$SHELL" != "/usr/bin/zsh" ]; then
-	# Install zsh shell
-	sudo apt install -y zsh
-
-	# Install oh-my-zsh
-	sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended
-	zsh
-fi;
-

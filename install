@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+
+set -e
+
+# Symlink things
+ln -s /workspaces/.codespaces/.persistedshare/dotfiles/* ~
+
+# Change default shell to zsh
+sudo chsh -s "$(which zsh)" "$(whoami)"
