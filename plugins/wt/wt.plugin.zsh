@@ -38,7 +38,8 @@ _wt_repo_root() {
             else
                 abs_gitdir="${toplevel}/${gitdir}"
             fi
-            # Navigate from .git/worktrees/<name> up to the repo root
+            # Resolve to canonical absolute path, then navigate up to repo root
+            abs_gitdir="${abs_gitdir:A}"
             local main_git_dir="${abs_gitdir:h:h:h}"
             echo "$main_git_dir"
             return
@@ -240,7 +241,18 @@ _wt_delete() {
         return 1
     fi
 
-    git worktree remove "$wt_dir" || return 1
+    local output
+    output=$(git -C "$root" worktree remove "$wt_dir" 2>&1)
+    if [[ $? -ne 0 ]]; then
+        if [[ "$output" == *"is not a working tree"* ]]; then
+            # Orphaned directory not tracked by git — remove directly
+            rm -rf "$wt_dir" || return 1
+            git -C "$root" worktree prune 2>/dev/null
+        else
+            echo "$output" >&2
+            return 1
+        fi
+    fi
     echo "Removed worktree: $name"
 }
 
@@ -461,13 +473,31 @@ _wt_status() {
                 fi
                 ;;
             'd')
-                # Delete with confirmation
-                printf '\e[2J\e[H'
-                printf 'Delete worktree "%s"? [y/N] ' "${wt_names[$selected]}"
-                confirm=""
-                read -sk 1 confirm
-                if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
-                    git worktree remove "${wt_dirs[$selected]}" 2>&1
+                # Delete with confirmation (skip main repo — it's not a worktree)
+                if [[ "${wt_dirs[$selected]}" == "$root" ]]; then
+                    printf '\e[2J\e[H'
+                    echo "Cannot delete the main repository checkout."
+                    echo "\nPress any key to continue..."
+                    read -sk 1
+                else
+                    printf '\e[2J\e[H'
+                    printf 'Delete worktree "%s"? [y/N] ' "${wt_names[$selected]}"
+                    confirm=""
+                    read -sk 1 confirm
+                    if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
+                        local del_output
+                        del_output=$(git -C "$root" worktree remove "${wt_dirs[$selected]}" 2>&1)
+                        if [[ $? -ne 0 ]]; then
+                            if [[ "$del_output" == *"is not a working tree"* ]]; then
+                                rm -rf "${wt_dirs[$selected]}"
+                                git -C "$root" worktree prune 2>/dev/null
+                            else
+                                echo "$del_output"
+                                echo "\nPress any key to continue..."
+                                read -sk 1
+                            fi
+                        fi
+                    fi
                 fi
                 # Full refresh after delete
                 _wt_status_refresh "$base_dir" "$root"
