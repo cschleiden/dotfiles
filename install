@@ -5,7 +5,7 @@ create_symlinks() {
     script_dir=$(dirname "$(readlink -f "$0")")
 
     # Get a list of all files in this directory that start with a dot.
-    files=$(find -maxdepth 1 -type f -name ".*")
+    files=$(find . -maxdepth 1 -type f -name ".*")
 
     # Create a symbolic link to each file in the home directory.
     for file in $files; do
@@ -18,5 +18,33 @@ create_symlinks() {
 
 create_symlinks
 
-# Change default shell to zsh
-sudo chsh -s "$(which zsh)" "$(whoami)"
+# Install oh-my-zsh
+sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended
+
+# Install custom plugins
+install_plugins() {
+    script_dir=$(dirname "$(readlink -f "$0")")
+    local plugin_dir="${ZSH_CUSTOM:-$HOME/.oh-my-zsh/custom}/plugins"
+    mkdir -p "$plugin_dir"
+
+    if [ -d "$script_dir/plugins/wt" ]; then
+        rm -rf "$plugin_dir/wt"
+        ln -s "$script_dir/plugins/wt" "$plugin_dir/wt"
+        echo "Installed wt plugin."
+    fi
+}
+
+install_plugins
+
+# Enable wt plugin in .zshrc if not already present
+if grep -q '^plugins=(' ~/.zshrc 2>/dev/null; then
+    if ! grep -q 'plugins=.*\bwt\b' ~/.zshrc; then
+        sed -i '' 's/^plugins=(\(.*\))/plugins=(\1 wt)/' ~/.zshrc
+        echo "Added wt to plugins in .zshrc."
+    fi
+fi
+
+# Change default shell to zsh if not already
+if [ "$(basename "$SHELL")" != "zsh" ]; then
+    sudo chsh -s "$(which zsh)" "$(whoami)"
+fi
