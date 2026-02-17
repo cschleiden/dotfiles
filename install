@@ -39,7 +39,7 @@ install_plugins
 # Enable wt plugin in .zshrc if not already present
 if grep -q '^plugins=(' ~/.zshrc 2>/dev/null; then
     if ! grep -q 'plugins=.*\bwt\b' ~/.zshrc; then
-        sed -i '' 's/^plugins=(\(.*\))/plugins=(\1 wt)/' ~/.zshrc
+        sed -i.bak 's/^plugins=(\(.*\))/plugins=(\1 wt)/' ~/.zshrc && rm -f ~/.zshrc.bak
         echo "Added wt to plugins in .zshrc."
     fi
 fi
