@@ -70,6 +70,7 @@ Worktrees for my-repo:
 ### `wt status`
 
 Interactive TUI dashboard showing all checkouts (including the main repo) with git status, sync info, and GitHub PR status.
+Expensive columns are loaded asynchronously, so the view appears immediately and fills in as data is ready.
 
 ```
   Worktrees for my-repo
@@ -91,12 +92,13 @@ Interactive TUI dashboard showing all checkouts (including the main repo) with g
 | `p`       | Git push from selected worktree    |
 | `f`       | Git pull in selected worktree      |
 | `r`       | Refresh all data                   |
-| `d`       | Delete worktree (with confirmation)|
+| `d`       | Delete worktree (with confirmation + live progress)|
 | `q` / `Esc` | Quit dashboard                  |
 
 ### `wt delete <worktree>`
 
 Remove a worktree.
+While deletion is running, `wt` shows live progress in the terminal.
 
 ```sh
 $ wt d cschleiden-my-feature

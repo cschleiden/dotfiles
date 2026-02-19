@@ -223,6 +223,70 @@ _wt_list() {
 # ---------------------------------------------------------------------------
 # wt delete <worktree-name>
 # ---------------------------------------------------------------------------
+_wt_remove_worktree() {
+    local root="$1"
+    local wt_dir="$2"
+    local name="$3"
+    local tmp_file
+    tmp_file=$(mktemp -t wt-remove.XXXXXX) || return 1
+
+    git -C "$root" worktree remove "$wt_dir" >"$tmp_file" 2>&1 &
+    local pid=$!
+    local -a spinner=('|' '/' '-' '\')
+    local idx=1
+
+    while kill -0 "$pid" 2>/dev/null; do
+        printf '\rDeleting worktree "%s"... %s' "$name" "${spinner[$idx]}"
+        idx=$(( idx % ${#spinner[@]} + 1 ))
+        sleep 0.1
+    done
+
+    wait "$pid"
+    local exit_status=$?
+    local output
+    output="$(<"$tmp_file")"
+    rm -f "$tmp_file"
+    printf '\r\033[K'
+
+    if [[ $exit_status -ne 0 ]]; then
+        if [[ "$output" == *"working trees containing submodules cannot be moved or removed"* ]]; then
+            local submodule_output deinit_status force_output force_status
+            submodule_output=$(git -C "$wt_dir" submodule deinit -f --all 2>&1)
+            deinit_status=$?
+
+            if [[ $deinit_status -eq 0 ]]; then
+                force_output=$(git -C "$root" worktree remove --force "$wt_dir" 2>&1)
+                force_status=$?
+                if [[ $force_status -eq 0 ]]; then
+                    return 0
+                fi
+                output="${output}${output:+$'\n'}${force_output}"
+            else
+                output="${output}${output:+$'\n'}${submodule_output}"
+            fi
+        fi
+
+        if [[ "$output" == *"contains modified or untracked files, use --force to delete it"* ]]; then
+            local dirty_force_output dirty_force_status
+            dirty_force_output=$(git -C "$root" worktree remove --force "$wt_dir" 2>&1)
+            dirty_force_status=$?
+            if [[ $dirty_force_status -eq 0 ]]; then
+                return 0
+            fi
+            output="${output}${output:+$'\n'}${dirty_force_output}"
+        fi
+
+        if [[ "$output" == *"is not a working tree"* ]]; then
+            rm -rf "$wt_dir" || return 1
+            git -C "$root" worktree prune 2>/dev/null
+            return 0
+        fi
+        [[ -n "$output" ]] && echo "$output" >&2
+        return 1
+    fi
+    return 0
+}
+
 _wt_delete() {
     local name="$1"
     if [[ -z "$name" ]]; then
@@ -241,18 +305,7 @@ _wt_delete() {
         return 1
     fi
 
-    local output
-    output=$(git -C "$root" worktree remove "$wt_dir" 2>&1)
-    if [[ $? -ne 0 ]]; then
-        if [[ "$output" == *"is not a working tree"* ]]; then
-            # Orphaned directory not tracked by git — remove directly
-            rm -rf "$wt_dir" || return 1
-            git -C "$root" worktree prune 2>/dev/null
-        else
-            echo "$output" >&2
-            return 1
-        fi
-    fi
+    _wt_remove_worktree "$root" "$wt_dir" "$name" || return 1
     echo "Removed worktree: $name"
 }
 
@@ -260,12 +313,88 @@ _wt_delete() {
 # wt status - Interactive TUI dashboard
 # ---------------------------------------------------------------------------
 
-# Gather/refresh worktree data into the caller's arrays
+# Compute expensive per-row columns in the background.
+_wt_status_row_worker() {
+    local dir="$1"
+    local branch="$2"
+    local has_gh="$3"
+    local out_file="$4"
+    local dirty sync pr_info changes upstream ahead behind pr_json pr_num pr_state pr_draft
+
+    dirty=""
+    sync=""
+    pr_info="(no PR)"
+
+    if [[ -e "${dir}/.git" ]]; then
+        changes=$(git -C "$dir" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+        if (( changes > 0 )); then
+            dirty="● ${changes} dirty"
+        else
+            dirty="✔ clean"
+        fi
+
+        upstream=$(git -C "$dir" rev-parse --abbrev-ref '@{upstream}' 2>/dev/null)
+        if [[ -n "$upstream" ]]; then
+            ahead=$(git -C "$dir" rev-list --count '@{upstream}..HEAD' 2>/dev/null || echo 0)
+            behind=$(git -C "$dir" rev-list --count 'HEAD..@{upstream}' 2>/dev/null || echo 0)
+            sync="↑${ahead} ↓${behind}"
+        else
+            sync="(no upstream)"
+        fi
+
+        if [[ "$has_gh" == "true" && -n "$branch" ]]; then
+            pr_json=$(gh pr list --repo "$(git -C "$dir" remote get-url origin 2>/dev/null)" --head "$branch" --json number,state,isDraft --limit 1 2>/dev/null)
+            if [[ -n "$pr_json" && "$pr_json" != "[]" ]]; then
+                pr_num=$(echo "$pr_json" | command grep -o '"number":[0-9]*' | head -1 | cut -d: -f2)
+                pr_state=$(echo "$pr_json" | command grep -o '"state":"[^"]*"' | head -1 | cut -d'"' -f4)
+                pr_draft=$(echo "$pr_json" | command grep -o '"isDraft":[a-z]*' | head -1 | cut -d: -f2)
+                if [[ "$pr_draft" == "true" ]]; then
+                    pr_info="PR #${pr_num} draft"
+                else
+                    pr_info="PR #${pr_num} ${pr_state:l}"
+                fi
+            fi
+        fi
+    fi
+
+    printf '%s\t%s\t%s\n' "$dirty" "$sync" "$pr_info" > "$out_file"
+}
+
+# Merge finished async row workers back into the caller's arrays.
+_wt_status_poll_async() {
+    local i out_file dirty sync pr_info
+    for (( i=1; i<=${#wt_async_files[@]}; i++ )); do
+        if (( wt_async_done[$i] == 1 )); then
+            continue
+        fi
+
+        out_file="${wt_async_files[$i]}"
+        if [[ -f "$out_file" ]]; then
+            IFS=$'\t' read -r dirty sync pr_info < "$out_file"
+            wt_statuses[$i]="$dirty"
+            wt_sync[$i]="$sync"
+            wt_prs[$i]="$pr_info"
+            wt_async_done[$i]=1
+            (( wt_async_pending > 0 )) && (( wt_async_pending-- ))
+            rm -f "$out_file"
+        fi
+    done
+}
+
+# Gather/refresh data into the caller's arrays.
 _wt_status_refresh() {
     local base_dir="$1"
     local repo_root="$2"
     local has_gh=false
     (( $+commands[gh] )) && has_gh=true
+
+    if (( ${#wt_async_pids[@]} > 0 )); then
+        local pid
+        for pid in "${wt_async_pids[@]}"; do
+            kill "$pid" 2>/dev/null
+        done
+    fi
+    [[ -n "$wt_async_tmp" && -d "$wt_async_tmp" ]] && rm -rf "$wt_async_tmp"
 
     wt_names=()
     wt_branches=()
@@ -273,6 +402,11 @@ _wt_status_refresh() {
     wt_sync=()
     wt_prs=()
     wt_dirs=()
+    wt_async_pids=()
+    wt_async_files=()
+    wt_async_done=()
+    wt_async_pending=0
+    wt_async_tmp=$(mktemp -d -t wt-status.XXXXXX) || return 1
 
     # Include the main repo checkout first
     local all_dirs=("$repo_root")
@@ -281,7 +415,8 @@ _wt_status_refresh() {
         all_dirs+=("${base_dir}"/*(N/))
     fi
 
-    local name branch dirty sync pr_info changes upstream ahead behind pr_json pr_num pr_state pr_draft
+    local i=1
+    local name branch out_file
     for dir in "${all_dirs[@]}"; do
         if [[ "$dir" == "$repo_root" ]]; then
             name="${repo_root:t}"
@@ -289,54 +424,24 @@ _wt_status_refresh() {
             name="${dir:t}"
         fi
         branch=""
-        dirty=""
-        sync=""
-        pr_info="(no PR)"
+        if [[ -e "${dir}/.git" ]]; then
+            branch=$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null)
+        fi
 
         wt_dirs+=("$dir")
         wt_names+=("$name")
-
-        if [[ -e "${dir}/.git" ]]; then
-            branch=$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null)
-
-            # Dirty/clean
-            changes=$(git -C "$dir" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
-            if (( changes > 0 )); then
-                dirty="● ${changes} dirty"
-            else
-                dirty="✔ clean"
-            fi
-
-            # Ahead/behind
-            upstream=$(git -C "$dir" rev-parse --abbrev-ref '@{upstream}' 2>/dev/null)
-            if [[ -n "$upstream" ]]; then
-                ahead=$(git -C "$dir" rev-list --count '@{upstream}..HEAD' 2>/dev/null || echo 0)
-                behind=$(git -C "$dir" rev-list --count 'HEAD..@{upstream}' 2>/dev/null || echo 0)
-                sync="↑${ahead} ↓${behind}"
-            else
-                sync="(no upstream)"
-            fi
-
-            # PR status
-            if [[ "$has_gh" == "true" && -n "$branch" ]]; then
-                pr_json=$(gh pr list --repo "$(git -C "$dir" remote get-url origin 2>/dev/null)" --head "$branch" --json number,state,isDraft --limit 1 2>/dev/null)
-                if [[ -n "$pr_json" && "$pr_json" != "[]" ]]; then
-                    pr_num=$(echo "$pr_json" | command grep -o '"number":[0-9]*' | head -1 | cut -d: -f2)
-                    pr_state=$(echo "$pr_json" | command grep -o '"state":"[^"]*"' | head -1 | cut -d'"' -f4)
-                    pr_draft=$(echo "$pr_json" | command grep -o '"isDraft":[a-z]*' | head -1 | cut -d: -f2)
-                    if [[ "$pr_draft" == "true" ]]; then
-                        pr_info="PR #${pr_num} draft"
-                    else
-                        pr_info="PR #${pr_num} ${pr_state:l}"
-                    fi
-                fi
-            fi
-        fi
-
         wt_branches+=("${branch:-(detached)}")
-        wt_statuses+=("$dirty")
-        wt_sync+=("$sync")
-        wt_prs+=("$pr_info")
+        wt_statuses+=("(loading)")
+        wt_sync+=("(loading)")
+        wt_prs+=("(loading)")
+
+        out_file="${wt_async_tmp}/row-${i}.out"
+        wt_async_files+=("$out_file")
+        wt_async_done+=(0)
+        _wt_status_row_worker "$dir" "$branch" "$has_gh" "$out_file" &!
+        wt_async_pids+=("$!")
+        (( wt_async_pending++ ))
+        (( i++ ))
     done
 }
 
@@ -349,6 +454,9 @@ _wt_status() {
 
     # Gather data for each worktree (includes main checkout)
     local -a wt_names wt_branches wt_statuses wt_sync wt_prs wt_dirs
+    local -a wt_async_pids wt_async_files wt_async_done
+    local wt_async_pending=0
+    local wt_async_tmp=""
     _wt_status_refresh "$base_dir" "$root"
 
     local count=${#wt_names}
@@ -366,11 +474,18 @@ _wt_status() {
     trap '_wt_status_cleanup' INT TERM
 
     while true; do
+        _wt_status_poll_async
+
         # Clear screen
         printf '\e[2J\e[H'
 
         # Header
-        printf '\e[1m  Worktrees for %s\e[0m\n\n' "$repo_name"
+        printf '\e[1m  Worktrees for %s\e[0m\n' "$repo_name"
+        if (( wt_async_pending > 0 )); then
+            printf '  \e[90mLoading details... %d remaining\e[0m\n\n' "$wt_async_pending"
+        else
+            echo ""
+        fi
 
         # Rows
         for i in {1..$count}; do
@@ -406,7 +521,14 @@ _wt_status() {
 
         # Read keypress
         key=""
-        read -sk 1 key
+        if (( wt_async_pending > 0 )); then
+            read -sk 1 -t 0.1 key 2>/dev/null
+            if [[ -z "$key" ]]; then
+                continue
+            fi
+        else
+            read -sk 1 key
+        fi
 
         case "$key" in
             $'\e')
@@ -453,24 +575,9 @@ _wt_status() {
                 git -C "${wt_dirs[$selected]}" pull 2>&1
                 echo "\nPress any key to continue..."
                 read -sk 1
-                # Refresh dirty/sync data for this worktree
-                local i=$selected
-                local dir="${wt_dirs[$i]}"
-                local changes
-                changes=$(git -C "$dir" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
-                if (( changes > 0 )); then
-                    wt_statuses[$i]="● ${changes} dirty"
-                else
-                    wt_statuses[$i]="✔ clean"
-                fi
-                local upstream
-                upstream=$(git -C "$dir" rev-parse --abbrev-ref '@{upstream}' 2>/dev/null)
-                if [[ -n "$upstream" ]]; then
-                    local ahead behind
-                    ahead=$(git -C "$dir" rev-list --count '@{upstream}..HEAD' 2>/dev/null || echo 0)
-                    behind=$(git -C "$dir" rev-list --count 'HEAD..@{upstream}' 2>/dev/null || echo 0)
-                    wt_sync[$i]="↑${ahead} ↓${behind}"
-                fi
+                _wt_status_refresh "$base_dir" "$root"
+                count=${#wt_names}
+                (( selected > count )) && selected=$count
                 ;;
             'd')
                 # Delete with confirmation (skip main repo — it's not a worktree)
@@ -485,17 +592,9 @@ _wt_status() {
                     confirm=""
                     read -sk 1 confirm
                     if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
-                        local del_output
-                        del_output=$(git -C "$root" worktree remove "${wt_dirs[$selected]}" 2>&1)
-                        if [[ $? -ne 0 ]]; then
-                            if [[ "$del_output" == *"is not a working tree"* ]]; then
-                                rm -rf "${wt_dirs[$selected]}"
-                                git -C "$root" worktree prune 2>/dev/null
-                            else
-                                echo "$del_output"
-                                echo "\nPress any key to continue..."
-                                read -sk 1
-                            fi
+                        if ! _wt_remove_worktree "$root" "${wt_dirs[$selected]}" "${wt_names[$selected]}"; then
+                            echo "\nPress any key to continue..."
+                            read -sk 1
                         fi
                     fi
                 fi
@@ -532,6 +631,13 @@ _wt_status() {
 }
 
 _wt_status_cleanup() {
+    if (( ${#wt_async_pids[@]} > 0 )); then
+        local pid
+        for pid in "${wt_async_pids[@]}"; do
+            kill "$pid" 2>/dev/null
+        done
+    fi
+    [[ -n "$wt_async_tmp" && -d "$wt_async_tmp" ]] && rm -rf "$wt_async_tmp"
     printf '\e[?25h'              # show cursor
     tput rmcup 2>/dev/null        # leave alternate screen
     trap - INT TERM
